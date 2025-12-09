@@ -2,61 +2,95 @@
 local entries = {}
 local M = {}
 
--- (Crudely) Locates the bibliography
-local function locate_bib(lines)
+-- strips YAML comments from a line
+-- Preserves # inside quotes otherwise strips content after #
+local function strip_yaml_comment(str)
+  if not str then
+    return nil
+  end
+  local quoted = str:match '^%s*(".-")' or str:match "^%s*('.-')"
+  if quoted then
+    return quoted
+  end
+  return str:match '^%s*(.-)%s*#' or str:match '^%s*(.-)%s*$'
+end
+
+-- TODO: Won't handle a table of bibs but that feels very niche/edge case
+--- Locates the bibliography reference in buffer or _quarto.yml
+--- @param lines table The lines of the current buffer to parse
+--- @return string|nil bib_str An unsanitized bibliography path string (YAML comments stripped)
+--- @return string|nil root The path to root of the file where the bibliography is referenced.
+local function locate_bib_str(lines)
+  local root = vim.fn.expand '%:p:h'
   for _, line in ipairs(lines) do
-    local location = string.match(line, [[bibliography[%s]*[:=\(]["'%s]*([%w./%-\]+)["'%s]*[\)]?]])
-    if location then
-      return location
+    local bib_line = string.match(line, [[bibliography[%s]*[:=\(]%s*(.-)%s*[\)]?$]])
+    local location = strip_yaml_comment(bib_line)
+    if location and location ~= '' then
+      return location, root
     end
   end
   -- no bib locally defined
   -- test for quarto project-wide definition
   local fname = vim.api.nvim_buf_get_name(0)
-  local root = require('lspconfig.util').root_pattern '_quarto.yml'(fname)
+  if vim.fn.has 'nvim-10.0.0' then
+    root = vim.fs.root(fname, '_quarto.yml')
+  else
+    root = require('lspconfig.util').root_pattern '_quarto.yml'(fname)
+  end
   if root then
     local file = root .. '/_quarto.yml'
-    for line in io.lines(file) do
-      local location = string.match(line, 'bibliography: (%g+)')
+    local quarto_lines
+    local ok, lines_or_err = pcall(io.lines, file)
+    if ok then
+      quarto_lines = lines_or_err
+    else
+      vim.notify_once(
+        string.format('Unable to open _quarto_yml file at %s:%s', file, lines_or_err),
+        vim.log.levels.WARN
+      )
+      return nil
+    end
+    for line in quarto_lines do
+      local bib_line = string.match(line, 'bibliography:%s*(.+)$')
+      local location = strip_yaml_comment(bib_line)
       if location then
-        return location
+        return location, root
       end
     end
   end
 end
 
+-- Clean up the path from a bibliography string
 local function sanitize_path(path)
-  -- Sanitize the path: remove quotes and trim whitespace
-  -- This duplicates some functionality from locate_quarto_bib
-  path = path:gsub('^%s*["]?(.-)["\']?%s*$', '%1')
-  -- Convert escaped spaces to regular spaces
-  path = path:gsub('\\ ', ' ')
-  -- Unescape backslashes
-  path = path:gsub('\\([/"])', '%1')
-  return path
+  -- Trim whitespace
+  path = path:match '^%s*(.-)%s*$'
+  -- Remove surrounding quotes
+  local unquoted = path:match '^"(.-)"$' or path:match "^'(.-)'$" or path
+  -- Unescape
+  unquoted = unquoted:gsub('\\ ', ' ')
+  unquoted = unquoted:gsub('\\([/"])', '%1')
+  return unquoted
 end
 
 --- Resolves bibliography file path from string or function
 --- @param lines table The lines of the current buffer to parse
 --- @return string|nil Absolute path to bibliography file or nil if not found
 local function get_bib_path(lines)
-  -- locate bib reference as before
-  local initial_bib = locate_bib(lines)
-  -- return nil and log if bib not specified
-  if not initial_bib then
+  -- locate string of bib path (YAML frontmatter or _quarto.yml)
+  local bib_str, root = locate_bib_str(lines)
+  if not bib_str then
     vim.notify_once('cmp-pandoc-references: No bibliography file specification found in document', vim.log.levels.DEBUG)
     return nil
   end
-  -- Sanitize and expand the path
-  local sanitized_path = sanitize_path(initial_bib)
-  -- Try direct, sanitized, path first
+
+  local sanitized_path = sanitize_path(bib_str)
+  -- Try direct path first
   local direct_path = vim.fn.expand(sanitized_path)
   if vim.fn.filereadable(direct_path) == 1 then
     return vim.fn.fnamemodify(direct_path, ':p')
   end
-  -- Try relative to buffer directory
-  local buf_dir = vim.fn.expand '%:p:h'
-  local full_path = buf_dir .. '/' .. sanitized_path
+  -- Try relative to root (_quarto.yml or buf)
+  local full_path = root .. '/' .. sanitized_path
   full_path = vim.fn.expand(full_path)
   if vim.fn.filereadable(full_path) == 1 then
     return vim.fn.fnamemodify(full_path, ':p')
@@ -82,9 +116,9 @@ end
 -- Parses the .bib file, formatting the completion item
 -- Adapted from http://rgieseke.github.io/ta-bibtex/
 local function parse_bib(filename, fields)
-  local file = io.open(filename, 'rb')
+  local file, err = io.open(filename, 'rb')
   if file == nil then
-    vim.notify_once(string.format('Unable to open bibliography file at: %s', filename), vim.log.levels.WARN)
+    vim.notify_once(string.format('Unable to open bibliography file at %s:%s', filename, err), vim.log.levels.WARN)
     return
   end
   local bibentries = file:read '*all'
